@@ -7,7 +7,7 @@ Context and position mutabilities of the model learned on out-of-frame lineages 
 ## Example of use
 
 After cloning the repository:
-```{python}
+```python
 import pandas as pd
 df_context = pd.read_csv("shmoof/mutabilities_context.tsv", sep="\t").set_index("Motif")
 df_pos = pd.read_csv("shmoof/mutabilities_position.tsv", sep="\t").set_index("Position")
