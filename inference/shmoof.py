@@ -5,20 +5,30 @@ from ete3 import PhyloTree
 from tqdm import tqdm
 from multiprocessing import Pool,cpu_count
 from scipy.optimize import brentq
-
+import olga.load_model as load_model
+import olga.sequence_generation as seq_gen
 from utils import *
 
 class ContextPosition():
-    def __init__(self,individuals,data_location='oof_data/',threshold=20,seq_length=500):
+    def __init__(self,individuals,data_location='oof_data/',olga_location='olga/',threshold=20,seq_length=500):
         
         self.data_location = data_location
+        self.olga_location = olga_location
         self.seq_length = seq_length
         self.threshold = threshold
         self.exclude_x = []
         self.exclude_w = [0]
         
-        align,trees = self.readTrees(individuals)
-        self.traverseTrees(align,trees)
+        self.align,self.trees = self.readTrees(individuals)
+        
+        self.gamma = np.ones(4**5+1)
+        self.gamma[0] = 0
+        self.beta = np.ones(self.seq_length)
+        
+        self.mutate2 = {'A': ['C','G','T'],
+                        'C': ['A','G','T'],
+                        'G': ['A','C','T'],
+                        'T': ['A','C','G']}
 
     def sequence2glossary(self,sequence,x_position=2): 
         '''
@@ -159,10 +169,14 @@ class ContextPosition():
         pool.close()
         return gamma
                               
-    def infer(self,nb_of_iterations=10,beta0=None):
+    def infer(self,align=None,trees=None,nb_of_iterations=10,beta0=None):
         '''
         Maximizing likelihood in self.nb_of_iterations steps 
         '''
+        if align is None: align=self.align
+        if trees is None: trees=self.trees
+            
+        self.traverseTrees(align,trees)
         if beta0 is None: beta0=np.ones(self.seq_length,dtype=float)
         gammas = np.zeros((1025,nb_of_iterations),dtype=float)
         betas = np.zeros((self.seq_length,nb_of_iterations),dtype=float)
@@ -172,4 +186,66 @@ class ContextPosition():
             gammas[:,i] = gamma1
             betas[:,i] = beta1    
             beta0 = beta1
+        self.gamma, self.beta = gammas[:,-1], betas[:,-1]
         return gammas,betas
+    
+    def loadOLGA(self):
+        params_file_name = self.olga_location+'default_models/human_B_heavy/model_params.txt'
+        marginals_file_name = self.olga_location+'default_models/human_B_heavy/model_marginals.txt'
+        V_anchor_pos_file = self.olga_location+'default_models/human_B_heavy/V_gene_CDR3_anchors.csv'
+        J_anchor_pos_file = self.olga_location+'default_models/human_B_heavy/J_gene_CDR3_anchors.csv'
+        self.Data = load_model.GenomicDataVDJ()
+        self.Data.load_igor_genomic_data(params_file_name, V_anchor_pos_file, J_anchor_pos_file)
+        generative_model = load_model.GenerativeModelVDJ()
+        generative_model.load_and_process_igor_model(marginals_file_name)
+        self.Generator = seq_gen.SequenceGenerationVDJ(generative_model, self.Data)
+    
+    def generate(self):
+        """ Generate a sequence from Pgen distribution """
+        if not hasattr(self, 'Generator'): self.loadOLGA()
+        cdr3,_,v,j = self.Generator.gen_rnd_prod_CDR3()
+        fwr1_fwr3 = self.Data.genV[v][2].replace(self.Data.genV[v][1],'')
+        fwr4 = self.Data.genJ[j][2].replace(self.Data.genJ[j][1],'')
+        return  fwr1_fwr3 + cdr3 + fwr4
+
+    def mutate(self,sequence,nbOfMutations=1):
+        """ Introduce a mutation according to 
+            ContextPosition.gamma and ContextPosition.beta """
+        sequenceList = list(sequence)
+        glossary = self.sequence2glossary(sequence)    
+        weights = self.gamma[glossary] * self.beta
+        chances = weights/sum(weights)
+        xs = np.random.choice(range(self.seq_length), nbOfMutations, p=chances, replace=False)
+        for x in xs: sequenceList[x] = np.random.choice(self.mutate2.get(sequence[x]))
+        return "".join(sequenceList)
+    
+    def simulate(self):
+        """ Simulate trees with original topologies 
+            Pgen-generated roots and
+            ContextPosition mutations """
+        df = pd.DataFrame()
+        for family,local_align in tqdm(self.align[['FAMILY','NODE','ALIGNMENT']].groupby(['FAMILY'])):
+            labels,sequences = [],[]
+            structure = self.trees[self.trees['FAMILY']==family].values[0][1]
+            alignment = df2fasta(local_align[['NODE','ALIGNMENT']])
+            tree = PhyloTree(structure, alignment, format=1, alg_format='fasta')
+            treeCopy = PhyloTree(structure, alignment, format=1, alg_format='fasta')
+            for node,nodeCopy in zip(tree.traverse('preorder'),treeCopy.traverse('preorder')):
+                if not node.is_leaf():
+                    for child,childCopy in zip(node.children,nodeCopy.children):
+                        nbOfMutations = howManyMutations(child.sequence,node.sequence)
+                        if child.name == '0': 
+                            childCopy.sequence = self.generate()
+                            nodeCopy.sequence = self.mutate(childCopy.sequence, nbOfMutations)
+                            labels.append(nodeCopy.name)
+                            sequences.append(nodeCopy.sequence)
+                        else:
+                            childCopy.sequence = self.mutate(nodeCopy.sequence, nbOfMutations)
+                        labels.append(childCopy.name)
+                        sequences.append(childCopy.sequence)
+            local_df = pd.DataFrame()
+            local_df['NODE'] = labels
+            local_df['ALIGNMENT'] = sequences
+            local_df['FAMILY'] = family
+            df = pd.concat([df,local_df],ignore_index=True)
+        return df

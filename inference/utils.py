@@ -77,3 +77,12 @@ def function_for_x(rates,sum_rates_const,beta):
             summa += rate*(1.0/(np.exp(rate*beta)-1.0))   
     return summa - sum_rates_const
 
+def howManyMutations(parent,child):
+    '''
+    return the number of mutations
+    '''
+    number = 0
+    for x,(nt,old_nt) in enumerate(zip(child,parent)):
+        if nt != old_nt and nt != 'N' and old_nt != 'N':
+            number += 1
+    return number
